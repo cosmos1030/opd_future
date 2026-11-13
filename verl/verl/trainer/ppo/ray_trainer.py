@@ -253,6 +253,13 @@ def compute_advantage(
             adv_kwargs["true_reward_score"] = data.batch["true_reward_score"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if "values" in data.batch:  # optional, populated when critic.enable=True
+            adv_kwargs["values"] = data.batch["values"]
+        # needed by the gated temporal estimator: which top-k slot the sampled token
+        # occupies, and how peaked the policy is at each position
+        for _k in ("student_top_k_ids", "student_top_k_log_probs", "responses"):
+            if _k in data.batch:
+                adv_kwargs[_k] = data.batch[_k]
 
         # calculate advantage estimator
         res = adv_estimator_fn(**adv_kwargs)

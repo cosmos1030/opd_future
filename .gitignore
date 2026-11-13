@@ -1,0 +1,9 @@
+model/
+outputs/
+logs/
+validation_log/
+wandb/
+*.whl
+__pycache__/
+*.pyc
+*.bak

@@ -25,6 +25,8 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 import numpy as np
+import os
+
 import torch
 from omegaconf import DictConfig
 
@@ -877,6 +879,232 @@ def compute_token_reward_direct_advantage(
         advantages = token_level_rewards * response_mask
         returns = advantages.clone()
     
+    return advantages, returns
+
+
+# ---------------------------------------------------------------------------
+# Discounted temporal credit (gamma-OPD).
+#
+#   A_t = sum_{j>=0} gamma^j * r_{t+j}
+#
+# gamma=0 is token_reward_direct, gamma=1 is sequence-level; the sweep between
+# them is the experiment. It costs nothing extra: the realised continuation's
+# rewards are already computed, so this is a masked reverse discounted cumsum.
+#
+# Why this rather than deeper exact enumeration. On this pair (opd_horizon
+# lagwise data, 321 branch points x 4 actions x 16 rollouts x 32 lags) the
+# action spread of A grows 33x from gamma=0 to gamma=0.99 (3.7e-2 -> 1.25)
+# while the rollout noise stays far below it -- SNR 5.0 at gamma=0.99. And the
+# far-horizon sum is a DIFFERENT quantity, not a smoothed version of the local
+# one: corr with the 1-step term is 0.41 at gamma=0.99, against 0.63 for the
+# depth-2 term that was already tested and found inert. Closing depth 2 said
+# nothing about this regime.
+_GAMMA_CALLS = 0
+
+
+@register_adv_est("token_reward_gamma")
+def compute_token_reward_gamma_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Discounted future OPD credit on the realised continuation.
+
+    Rewards may be (bs, L) or (bs, L, k); discounting runs along L either way.
+    """
+    global _GAMMA_CALLS
+    gamma = float(os.environ.get("OPD_GAMMA", "0.99"))
+    with torch.no_grad():
+        mask = response_mask.unsqueeze(-1) if token_level_rewards.dim() == 3 else response_mask
+        r = token_level_rewards * mask
+        if gamma <= 0.0:
+            adv = r
+        else:
+            # Reverse scan. The closed form (multiply by gamma^-t, cumsum, scale
+            # back) overflows well before L=7168, so this stays a scan.
+            adv = torch.zeros_like(r)
+            run = torch.zeros_like(r[:, 0])
+            for t in range(r.shape[1] - 1, -1, -1):
+                run = r[:, t] + gamma * run * mask[:, t]
+                adv[:, t] = run
+            adv = adv * mask
+        returns = adv.clone()
+    _GAMMA_CALLS += 1
+    if _GAMMA_CALLS <= 5:
+        # mask is (bs, L, 1) when rewards are (bs, L, k), so boolean-index with
+        # it directly is a shape error -- weight instead, which also gives the
+        # masked mean without materialising an index.
+        w = mask.expand_as(r) if mask.shape != r.shape else mask
+        n = w.sum().clamp(min=1.0)
+        a_mean = (adv.abs() * w).sum() / n
+        r_mean = (r.abs() * w).sum() / n
+        print(f"[gamma-opd] call {_GAMMA_CALLS}: gamma={gamma} "
+              f"|A| mean={a_mean.item():.4f} |r| mean={r_mean.item():.4f} "
+              f"ratio={(a_mean / r_mean.clamp(min=1e-9)).item():.2f}", flush=True)
+    return adv, returns
+
+
+# ---------------------------------------------------------------------------
+# Gated temporal OPD credit.
+#
+# Static analysis (opd_horizon/FOLLOWUP_2026-09-25.md) found, for this student/teacher
+# pair on DAPO-Math:
+#   * action influence in the OPD reward decays fast -- I_k halves by lag 5, gone by 24
+#   * depth 2 recovers the exact depth-3 gradient direction at cos 0.9994
+#   * the signal lives at UNCERTAIN tokens, not at "reasoning decisions": policy-weighted
+#     spread is ~3400x smaller where top-1 prob ~ 1.0, and what remains there merely
+#     repeats the token gradient (cos +0.64)
+#   * gating on top-1 < 0.8 keeps 91.8% of the new temporal energy for 16.4% of tokens
+#
+# WHAT THIS IMPLEMENTS, AND WHAT IT DOES NOT. The analysis computed Q_2 by ENUMERATING
+# the top-k successors exactly. Doing that inside training costs ~72 extra single-token
+# forwards per gated position on both models -- roughly 3.4x the step time, and it needs
+# KV-cache reuse inside the FSDP/rmpad path. This estimator instead uses the ONE sample
+# the rollout already provides: the realised continuation's own future rewards, which
+# are already computed and therefore free. It is the same credit term with a 1-sample
+# estimate of the inner expectation, so it carries the rollout variance the exact
+# version was designed to remove. If the smoke test shows a signal, the exact version is
+# the next step; if this shows nothing, the exact version is unlikely to rescue it.
+#
+# The future credit attaches to the REALISED action only. A term spread equally over the
+# top-k contributes a gradient C*(K*pi_j - 1) -- a function of the current policy alone,
+# which identifies the better action at exactly chance (6.25% at K=16, measured). The
+# indicator form scores 99.86%.
+GATED2_LAMBDA = float(os.environ.get("OPD_GATED2_LAMBDA", "1.0"))
+GATED2_GATE_TOP1 = float(os.environ.get("OPD_GATED2_GATE", "0.8"))
+GATED2_HORIZON = int(os.environ.get("OPD_GATED2_HORIZON", "2"))
+_GATED2_CALLS = 0
+
+
+@register_adv_est("token_reward_direct_gated2step")
+def compute_token_reward_gated2step_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    student_top_k_ids: torch.Tensor = None,
+    student_top_k_log_probs: torch.Tensor = None,
+    responses: torch.Tensor = None,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """token_reward_direct plus a bounded future term at uncertain positions only.
+
+        A_t[k] = rm[t,k] + lambda * gate_t * 1[a_k == a_t] * sum_{j=1..H-1} rbar_{t+j}
+        rbar_s = sum_k rm[s,k]          gate_t = 1 if max_k p_S(a_k|s_t) < threshold
+
+    Falls back to plain token_reward_direct if the extra tensors are absent, so the
+    baseline path is unaffected.
+    """
+    with torch.no_grad():
+        if token_level_rewards.dim() != 3 or student_top_k_ids is None or responses is None:
+            mask = response_mask.unsqueeze(-1) if token_level_rewards.dim() == 3 else response_mask
+            adv = token_level_rewards * mask
+            return adv, adv.clone()
+
+        dev = token_level_rewards.device
+        m2 = response_mask.unsqueeze(-1)
+        rm = token_level_rewards * m2                       # (B, T, K)
+        rbar = rm.sum(-1) * response_mask                   # (B, T)
+
+        # future credit: the next H-1 positions of the realised continuation
+        fut = torch.zeros_like(rbar)
+        for j in range(1, max(GATED2_HORIZON, 1)):
+            fut[:, : rbar.shape[1] - j] += rbar[:, j:]
+
+        # gate on how peaked the policy is. student_top_k_log_probs are full-vocab
+        # log-probs gathered at the top-k ids, so the max over k IS the top-1 prob.
+        if student_top_k_log_probs is not None:
+            top1 = student_top_k_log_probs.to(dev).max(-1).values.exp()
+            gate = (top1 < GATED2_GATE_TOP1).float() * response_mask
+        else:
+            gate = response_mask.clone()
+
+        # which top-k slot holds the token actually emitted
+        hit = (student_top_k_ids.to(dev) == responses.to(dev).unsqueeze(-1)).float()
+
+        bonus = GATED2_LAMBDA * (gate * fut).unsqueeze(-1) * hit * m2
+        adv = rm + bonus
+
+        # "no difference" must be distinguishable from "the term never fired"
+        global _GATED2_CALLS
+        _GATED2_CALLS += 1
+        if _GATED2_CALLS <= 5 or _GATED2_CALLS % 20 == 0:
+            n_valid = response_mask.sum().clamp(min=1)
+            print(f"[gated2step] call {_GATED2_CALLS}: gate fires at "
+                  f"{(gate.sum()/n_valid).item():.1%} of valid positions | "
+                  f"emitted token inside top-k at {(hit.sum(-1)*response_mask).sum().div(n_valid).item():.1%} | "
+                  f"mean|bonus|/mean|rm| = "
+                  f"{(bonus.abs().sum()/rm.abs().sum().clamp(min=1e-12)).item():.4f} | "
+                  f"lambda={GATED2_LAMBDA} gate<{GATED2_GATE_TOP1} H={GATED2_HORIZON}",
+                  flush=True)
+        return adv, adv.clone()
+
+
+# Critic baseline coefficient for token_reward_direct_critic. Matches the best
+# (least-degraded) setting found in the opd_critic_probe alpha sweep (0.25/0.5/1.0).
+TOKEN_REWARD_DIRECT_CRITIC_ALPHA = 0.5
+
+# Forward-looking window (in tokens) for the critic's return-to-go target, matching
+# the opd_critic_probe pilot's --window setting from its final successful alpha sweep.
+TOKEN_REWARD_DIRECT_CRITIC_WINDOW = 16
+
+
+@register_adv_est("token_reward_direct_critic")
+def compute_token_reward_direct_critic_advantage(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    token_reward_direct with a learned critic baseline subtracted for variance reduction.
+    advantages = token_level_rewards - alpha * values
+    Supports 3D rewards (batch, seq_len, k) when using top-k sampling; values stay
+    2D (bs, response_length) since the critic scores states, not per-candidate tokens.
+
+    The critic's regression target is a windowed return-to-go (sum of the next W
+    tokens' reward, matching the opd_critic_probe pilot), not the immediate token's
+    own reward — a value function must anticipate future reward, not just restate
+    the current one.
+
+    Args:
+        token_level_rewards: (bs, response_length) or (bs, response_length, k)
+        values: (bs, response_length) critic baseline estimate
+        response_mask: (bs, response_length)
+
+    Returns:
+        advantages: same shape as token_level_rewards
+        returns: (bs, response_length) critic regression target (windowed return-to-go)
+    """
+    with torch.no_grad():
+        is_topk = token_level_rewards.dim() == 3
+        if is_topk:
+            response_mask_topk = response_mask.unsqueeze(-1)
+            values_b = values.unsqueeze(-1)
+            r_t = (token_level_rewards * response_mask_topk).sum(dim=-1) / token_level_rewards.shape[-1]
+        else:
+            response_mask_topk = response_mask
+            values_b = values
+            r_t = token_level_rewards * response_mask
+
+        # Windowed return-to-go: R_window[t] = sum_{t'=t}^{t+W-1} r_t'
+        # (shorter than W near the end of the response, since we don't discard those
+        # positions — just sum whatever reward remains in the sequence).
+        W = TOKEN_REWARD_DIRECT_CRITIC_WINDOW
+        seq_len = r_t.shape[1]
+        r_t_flipped = torch.flip(r_t, dims=[1])
+        R_full_flipped = torch.cumsum(r_t_flipped, dim=1)
+        R_full = torch.flip(R_full_flipped, dims=[1])  # R_full[t] = sum_{t'=t}^{end} r_t'
+        R_full_padded = torch.cat(
+            [R_full, torch.zeros(R_full.shape[0], W, device=r_t.device, dtype=r_t.dtype)], dim=1
+        )
+        R_shifted = R_full_padded[:, W : W + seq_len]  # R_full[t+W], 0 if t+W >= seq_len
+        critic_target = (R_full - R_shifted) * response_mask
+
+        advantages = (token_level_rewards - TOKEN_REWARD_DIRECT_CRITIC_ALPHA * values_b) * response_mask_topk
+        returns = critic_target
+
     return advantages, returns
 
 

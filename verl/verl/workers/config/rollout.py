@@ -106,6 +106,10 @@ class RolloutConfig(BaseConfig):
     repetition_penalty: float = 1.0
     do_sample: bool = True
     n: int = 1
+    # vllm_rollout_spmd.py already reads config.get("seed", 0) and passes it to the vLLM
+    # engine, but the field was never declared here, so hydra rejected any attempt to set
+    # it. Without it every run samples identically and "different seeds" is a no-op.
+    seed: int = 0
 
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.

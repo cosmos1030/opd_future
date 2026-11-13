@@ -621,6 +621,19 @@ class DataParallelPPOActor(BasePPOActor):
             res_tensors["student_log_probs_on_teacher_ids"] = S_on_T
             
         res_tensors["rm_scores"] = rm_scores
+
+        # Snapshot the reward tensors when OPD_DUMP_DIR is set, so the offline
+        # branching experiment can be diffed against the real objective.
+        from verl.utils.opd_dump import maybe_dump
+
+        maybe_dump(
+            data,
+            rm_scores,
+            kl_val,
+            norm_weights,
+            extras={"S_ids": S_ids, "S_logp": S_logp, "T_on_S": T_on_S, "S_on_T": S_on_T},
+        )
+
         return DataProto.from_dict(tensors=res_tensors)
 
     def _optimizer_step(self):

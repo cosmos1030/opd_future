@@ -1024,6 +1024,17 @@ class DataParallelPPOActor(BasePPOActor):
                             # Standard reverse KL: log(π_actor / π_ref) = log_prob_actor - log_prob_ref
                             reverse_kl = old_log_prob - model_inputs["ref_log_prob"]
                         token_reverse_kl = reverse_kl
+                        # MiniLLM scales the per-token reward and clips it before
+                        # any accumulation (sampler.py: rewards / reward_scaling,
+                        # then clip to +/- cliprange_reward). Order matters: doing
+                        # it after the discounted sum would clip a different
+                        # quantity.
+                        _rs = getattr(self.config.policy_loss, "minillm_reward_scaling", None)
+                        if _rs:
+                            token_reverse_kl = token_reverse_kl / _rs
+                        _rc = getattr(self.config.policy_loss, "minillm_cliprange_reward", None)
+                        if _rc:
+                            token_reverse_kl = torch.clamp(token_reverse_kl, -_rc, _rc)
                         causal_reverse_kl = token_reverse_kl
                         if self.config.policy_loss.causal_opd:
                             causal_reverse_kl = discounted_reverse_cumsum(
@@ -1034,6 +1045,25 @@ class DataParallelPPOActor(BasePPOActor):
                                     causal_reverse_kl, response_mask, self.config.policy_loss.causal_gamma
                                 )
                         sampled_reward = -(causal_reverse_kl)
+                        # MiniLLM whitens the advantage
+                        # (_get_advantages_and_returns: advantages = whiten(rw)).
+                        # verl's own GAE does the same; the OPD path never did,
+                        # which is why h0 and h16 advantages differ 8.6x in scale.
+                        if getattr(self.config.policy_loss, "minillm_whiten", False):
+                            # masked_whiten applies a Bessel correction and raises
+                            # outright when the mask sums to 1 -- a microbatch holding
+                            # a single one-token response. MiniLLM whitens over the
+                            # whole rollout batch, where that cannot happen; per
+                            # microbatch it can, and it killed four runs at steps 2,
+                            # 7, 8, 24 and 27. One token carries no spread to
+                            # normalise, so centre it and leave the scale alone.
+                            if response_mask.sum() > 1:
+                                sampled_reward = verl_F.masked_whiten(sampled_reward, response_mask)
+                            else:
+                                sampled_reward = sampled_reward - verl_F.masked_mean(
+                                    sampled_reward, response_mask
+                                )
+                            sampled_reward = sampled_reward * response_mask.to(sampled_reward.dtype)
                         reopold_mask = None
                         if self.config.policy_loss.use_reopold:
                             sampled_reward, reopold_mask = apply_reopold_signal_processor(

@@ -1437,6 +1437,20 @@ class RayPPOTrainer:
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
+                        # OPD reward as a token-level reward, so verl's own GAE and
+                        # critic can consume it. The OPD path normally builds its
+                        # advantage inside dp_actor from reverse_kl and never touches
+                        # token_level_rewards, which leaves the critic with nothing to
+                        # regress on. Writing it here is what makes
+                        # adv_estimator=gae + critic.enable=True a controlled variant of
+                        # the same arm: identical reward, only the estimator differs.
+                        if self.config.algorithm.get("opd_reward_as_token_level", False):
+                            _rk = batch.batch["old_log_probs"] - batch.batch["ref_log_prob"]
+                            _m = batch.batch["response_mask"].to(_rk.dtype)
+                            # sign matches dp_actor's sampled_reward = -(reverse_kl):
+                            # higher means the student agrees with the teacher more.
+                            batch.batch["token_level_rewards"] = (-_rk) * _m
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True

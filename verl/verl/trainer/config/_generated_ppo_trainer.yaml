@@ -67,6 +67,10 @@ actor_rollout_ref:
       causal_opd: false
       causal_gamma: 0.0
       normalize_causal_by_discounted_weight: false
+      # MiniLLM-matched extras (minillm/sampler.py, minillm/losses.py)
+      minillm_whiten: false
+      minillm_reward_scaling: null
+      minillm_cliprange_reward: null
       use_local_future_correction: false
       future_correction_alpha: 1.0
       use_reward_advantage: false

@@ -60,6 +60,11 @@ import ray
 from ray._private.state import available_resources_per_node
 
 try:
+    # Upstream's address='auto'. An earlier attempt to pin this to
+    # MASTER_ADDR:MASTER_PORT hung inside ray.init with nothing loaded. The
+    # 7h stall it was meant to fix had a different cause: a backtick in a
+    # comment inside this double-quoted heredoc made bash run a stray
+    # ray start on every poll. That is gone now.
     ray.init(address='auto', logging_level='error', ignore_reinit_error=True)
     cluster_gpus = ray.cluster_resources().get('GPU', 0)
     per_node = available_resources_per_node()
@@ -152,6 +157,22 @@ run_training() {
     --min-worker-port="${RAY_MIN_WORKER_PORT}"
     --max-worker-port="${RAY_MAX_WORKER_PORT}"
   )
+  # Ray sizes its plasma store from TOTAL node memory, so two verl jobs on one
+  # node each reserve as if they owned it and the host OOM-killer takes both.
+  # That is what killed the first gammaopd/opd pair at step 77. Capping it lets
+  # the H200 node run one arm per 4-GPU NVLink island.
+  if [[ -n "${RAY_OBJECT_STORE_BYTES:-}" ]]; then
+    RAY_PORT_ARGS+=(--object-store-memory="${RAY_OBJECT_STORE_BYTES}")
+  fi
+  # ray also picks a node-manager and object-manager port on its own. Two jobs
+  # sharing a node collide on those even when every port the launcher exposes is
+  # distinct, and the second one dies with "Failed to register worker to Raylet".
+  if [[ -n "${RAY_NODE_MANAGER_PORT:-}" ]]; then
+    RAY_PORT_ARGS+=(--node-manager-port="${RAY_NODE_MANAGER_PORT}")
+  fi
+  if [[ -n "${RAY_OBJECT_MANAGER_PORT:-}" ]]; then
+    RAY_PORT_ARGS+=(--object-manager-port="${RAY_OBJECT_MANAGER_PORT}")
+  fi
 
   check_ray_ports
   trap "if (( ${node_rank} == 0 )); then ray stop || true; fi" EXIT
@@ -164,6 +185,7 @@ run_training() {
     # actor_rollout_ref.actor.optim.optimizer_impl=torch.optim \
     # actor_rollout_ref.actor.optim.optimizer=AdamW \
     python3 -m verl.trainer.main_ppo \
+      +ray_kwargs.ray_init.address="${MASTER_ADDR}:${MASTER_PORT}" \
       data.train_files="${TRAIN_FILE}" \
       data.val_files="${VAL_FILE}" \
       data.prompt_key=prompt \
@@ -188,8 +210,8 @@ run_training() {
       +actor_rollout_ref.ref.model.path="${TEACHER_MODEL}" \
       actor_rollout_ref.model.enable_gradient_checkpointing=True \
       actor_rollout_ref.actor.policy_loss.only_reverse_kl_advantages=True \
-      actor_rollout_ref.actor.optim.optimizer_impl=rad.optim \
-      actor_rollout_ref.actor.optim.optimizer=RADAR \
+      actor_rollout_ref.actor.optim.optimizer_impl="${OPTIM_IMPL:-rad.optim}" \
+      actor_rollout_ref.actor.optim.optimizer="${OPTIM_NAME:-RADAR}" \
       actor_rollout_ref.actor.optim.lr="${ACTOR_LR:-1e-5}" \
       actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
       actor_rollout_ref.actor.ppo_mini_batch_size="${mini_batch_size}" \

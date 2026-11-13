@@ -95,6 +95,10 @@ class PolicyLossConfig(BaseConfig):
     causal_opd: bool = False
     causal_gamma: float = 0.0
     normalize_causal_by_discounted_weight: bool = False
+    # MiniLLM-matched extras (minillm/sampler.py, minillm/losses.py)
+    minillm_whiten: bool = False
+    minillm_reward_scaling: float | None = None
+    minillm_cliprange_reward: float | None = None
     use_local_future_correction: bool = False
     future_correction_alpha: float = 1.0
     use_reward_advantage: bool = False

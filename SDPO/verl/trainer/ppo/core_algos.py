@@ -24,6 +24,7 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
 import numpy as np
+import os
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig
@@ -1254,15 +1255,51 @@ def compute_distil_self_distillation_loss(
             student_distill_log_probs = student_all_log_probs
             teacher_distill_log_probs = teacher_all_log_probs
 
-        # Term 1: forward cross-entropy H(pi_T || pi_theta)
-        teacher_distill_probs = torch.exp(teacher_distill_log_probs)
-        ce_per_token = -(teacher_distill_probs * student_distill_log_probs).sum(-1)
-        ce_per_token = torch.clamp(ce_per_token, min=0.0)
+        # ABLATION (DISTIL_DIV): which divergence supplies Term 1 and the token
+        # reward that Term 2 integrates.
+        #   ce      -sum_v pi_T(v) log pi_theta(v)        forward CE, as published
+        #   revkl    sum_v pi_theta(v) (log pi_theta(v) - log pi_T(v))
+        #   fwdkl    sum_v pi_T(v) (log pi_T(v) - log pi_theta(v))
+        # fwdkl differs from ce by exactly H(pi_T), which does not depend on
+        # theta -- so Term 1's GRADIENT is identical between the two and only
+        # Term 2 changes, because Term 2 uses the cost's VALUE as a reward. The
+        # teacher's entropy at a position says nothing about which token the
+        # student sampled there, so ce-vs-fwdkl isolates whether that
+        # action-independent part of the return matters. Unlike the
+        # baseline/common split in DISTIL_PG_MODE, both arms remain real
+        # trainable objectives.
+        # The paper pairs forward CE with the future term and reverse KL without
+        # it, so the divergence and the future term move together. This switch
+        # separates them: revkl + DISTIL_PG_MODE=on is reverse KL *with* the
+        # future term, which the paper never runs. Identical to the published
+        # path when unset.
+        _div = os.environ.get("DISTIL_DIV", "ce")
+        if _div == "revkl":
+            div_per_token = F.kl_div(
+                teacher_distill_log_probs,
+                student_distill_log_probs,
+                reduction="none",
+                log_target=True,
+            ).sum(-1)
+        elif _div == "fwdkl":
+            div_per_token = F.kl_div(
+                student_distill_log_probs,
+                teacher_distill_log_probs,
+                reduction="none",
+                log_target=True,
+            ).sum(-1)
+        elif _div == "ce":
+            teacher_distill_probs = torch.exp(teacher_distill_log_probs)
+            div_per_token = -(teacher_distill_probs * student_distill_log_probs).sum(-1)
+        else:
+            raise ValueError(f"unknown DISTIL_DIV={_div!r}; expected 'ce', 'revkl' or 'fwdkl'")
 
-        # Term 2: REINFORCE with future CE rewards (MiniLLM length normalization)
+        # Term 1
+        ce_per_token = torch.clamp(div_per_token, min=0.0)
+
+        # Term 2: REINFORCE with future rewards (MiniLLM length normalization)
         with torch.no_grad():
-            token_rewards = -(teacher_distill_probs * student_distill_log_probs).sum(-1)
-            token_rewards = torch.clamp(token_rewards, min=0.0)
+            token_rewards = torch.clamp(div_per_token.detach(), min=0.0)
             shifted = torch.cat(
                 [token_rewards[:, 1:], torch.zeros_like(token_rewards[:, :1])], dim=1
             )
@@ -1275,7 +1312,56 @@ def compute_distil_self_distillation_loss(
             remaining = (total_len - positions - 1).clamp(min=1.0)
             future_returns = future_returns / remaining
 
-        pg_per_token = student_log_probs * future_returns
+        # ABLATION (DISTIL_PG_MODE): isolate what Term 2 actually contributes.
+        #   on        log pi * R                 as published
+        #   off       0                          drop Term 2 entirely
+        #   baseline  log pi * (R - b(s))        keep action credit, drop common mode
+        #   common    log pi * b(s)              drop action credit, keep common mode
+        # baseline + common reproduce `on` exactly, so the two arms split the
+        # effect additively. b(s) is the leave-one-out mean of the return over the
+        # other sequences at the same position: a state-only quantity that cannot
+        # depend on this sequence's own action, which keeps the estimator unbiased.
+        # The paper compares DistIL against SDPO, which changes the objective AND
+        # removes the future term at once; this isolates the future term alone.
+        _pg_mode = os.environ.get("DISTIL_PG_MODE", "on")
+        if _pg_mode == "off":
+            pg_per_token = torch.zeros_like(student_log_probs)
+        elif _pg_mode in ("baseline", "common"):
+            with torch.no_grad():
+                m = loss_mask.to(future_returns.dtype)
+                masked_R = future_returns * m
+                cnt = m.sum(dim=0, keepdim=True)
+                tot = masked_R.sum(dim=0, keepdim=True)
+                b = ((tot - masked_R) / (cnt - m).clamp(min=1.0)) * m
+                metrics["distil/baseline_mean"] = (
+                    (b * m).sum() / m.sum().clamp(min=1.0)
+                ).item()
+            pg_per_token = student_log_probs * (
+                (future_returns - b) if _pg_mode == "baseline" else b
+            )
+        elif _pg_mode == "shuffle":
+            # Permute the returns across sequences within each position. The
+            # per-position multiset of weights -- and hence their scale and
+            # distribution -- is untouched; only the association between a
+            # sequence's own action and its own return is destroyed. Unlike the
+            # baseline/common split, both halves of which are degenerate on their
+            # own, this stays a trainable objective.
+            with torch.no_grad():
+                m = loss_mask.bool()
+                rand = torch.rand(future_returns.shape, device=future_returns.device)
+                rand = rand.masked_fill(~m, float("inf"))
+                perm = rand.argsort(dim=0)
+                src = (~m).to(torch.int8).argsort(dim=0, stable=True)
+                shuffled = torch.zeros_like(future_returns)
+                shuffled.scatter_(0, perm, future_returns.gather(0, src))
+                shuffled = shuffled * loss_mask.to(future_returns.dtype)
+                moved = ((future_returns - shuffled).abs() > 1e-9) & m
+                metrics["distil/shuffle_moved_frac"] = (
+                    moved.sum() / m.sum().clamp(min=1)
+                ).item()
+            pg_per_token = student_log_probs * shuffled
+        else:
+            pg_per_token = student_log_probs * future_returns
 
         with torch.no_grad():
             num_valid = loss_mask.sum().clamp(min=1.0)

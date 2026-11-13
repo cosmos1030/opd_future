@@ -893,7 +893,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self._is_actor:
                 self_distillation_cfg = self.config.actor.get("self_distillation", None)
                 loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
-                if self_distillation_cfg is not None and loss_mode == "sdpo":
+                # same upstream miss as ray_trainer.py:680 - the gate admits only
+                # "sdpo", so loss_mode="distil" never gets a teacher_module and
+                # dp_actor.py:144 raises "EMA teacher requires a separate teacher_module".
+                if self_distillation_cfg is not None and loss_mode in ("sdpo", "distil"):
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     if teacher_regularization == "trust-region":
                         self.actor.teacher_module = TrustRegionTeacher(

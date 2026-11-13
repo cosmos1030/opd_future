@@ -677,7 +677,11 @@ class RayPPOTrainer:
     ) -> Optional[tuple[DataProto, dict[str, float]]]:
         self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-        if self_distillation_cfg is None or loss_mode != "sdpo":
+        # upstream bug: this gate admits only "sdpo", so loss_mode="distil" never
+        # gets a teacher batch and dp_actor.py:693 then asserts on the missing
+        # teacher_* keys. dp_actor.py:833 already branches on "distil", so the
+        # rest of the path expects it.
+        if self_distillation_cfg is None or loss_mode not in ("sdpo", "distil"):
             return None
 
         device = batch.batch["input_ids"].device

@@ -15,7 +15,7 @@ NUM_PROCESSES=${NUM_PROCESSES:-4}
 accelerate launch \
     --config_file accelerate.yaml \
     --num_processes ${NUM_PROCESSES} \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps ${GRAD_ACC:-4} \
     --main_process_port 12949 \
     opsd_train.py \
     --model_name_or_path ${MODEL} \
@@ -23,9 +23,9 @@ accelerate launch \
     --loss_mode distil \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size ${PER_DEV:-2} \
     --gradient_checkpointing \
-    --gradient_accumulation_steps 4 \
+    --gradient_accumulation_steps ${GRAD_ACC:-4} \
     --output_dir ${OUTPUT_DIR} \
     --max_steps 100 \
     --save_steps 25 \
@@ -37,7 +37,7 @@ accelerate launch \
     --beta 0 \
     --use_vllm \
     --vllm_mode colocate \
-    --vllm_gpu_memory_utilization 0.5 \
+    --vllm_gpu_memory_utilization ${VLLM_UTIL:-0.5} \
     --vllm_tensor_parallel_size 1 \
     --use_peft \
     --lora_r 64 \

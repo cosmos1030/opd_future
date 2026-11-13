@@ -35,16 +35,13 @@ MODELS=(
 )
 
 DATA_PATHS=(
-    "datasets/sciknoweval/biology"
-    "datasets/sciknoweval/chemistry"
-    "datasets/sciknoweval/material"
-    "datasets/sciknoweval/physics"
+    ${DATA_PATHS:-"datasets/sciknoweval/biology datasets/sciknoweval/chemistry datasets/sciknoweval/material datasets/sciknoweval/physics"}
 )
 
 TRAIN_BATCH_SIZE=32
 MINI_BATCH_SIZE=32
 ROLLOUT_N=8
-LR="5e-5"
+LR="${LR:-5e-5}"
 LR_WARMUP_STEPS=10
 DISTILLATION_TOPK=100
 TEACHER_UPDATE_RATE=0.01
@@ -72,15 +69,15 @@ actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
 actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=True \
 algorithm.rollout_correction.rollout_is=token \
 actor_rollout_ref.rollout.val_kwargs.n=${VAL_N} \
-actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}"
+actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE} ${EXTRA_ARGS:-}"
 
     local run_cmd="bash ${REPO_DIR}/training/verl_training.sh ${exp_name} ${CONFIG_NAME} ${data_path} ${args}"
-    local setup_cmd="pip install -e ${REPO_DIR} --quiet; export PYTHONPATH=${REPO_DIR}:\$PYTHONPATH"
+    local setup_cmd="source /opt/anaconda3/2022.05/etc/profile.d/conda.sh; conda activate distil; unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES; export WANDB_ENTITY=dyk6208-gwangju-institute-of-science-and-technology; export DISTIL_PG_MODE=${DISTIL_PG_MODE:-on}; export VLLM_USE_FLASHINFER_SAMPLER=0; export PYTHONPATH=${REPO_DIR}:\$PYTHONPATH"
     local wrapped="srun bash -c '${setup_cmd}; ${run_cmd}'"
 
     local sbatch_args=(
         sbatch
-        --job-name="distil-science"
+        --job-name="${JOB_NAME:-hx-s}"
         --account="${ACCOUNT}"
         --partition="${PARTITION}"
         --nodes=1
@@ -113,7 +110,7 @@ for MODEL_PATH in "${MODELS[@]}"; do
     MODEL_NAME=$(echo "${MODEL_PATH}" | tr '/' '-')
     for DATA_PATH in "${DATA_PATHS[@]}"; do
         DOMAIN=$(basename "${DATA_PATH}")
-        EXP_NAME="DistIL-science-${DOMAIN}-${MODEL_NAME}"
+        EXP_NAME="DistIL-science-${DOMAIN}-${MODEL_NAME}${EXP_SUFFIX:-}"
         submit_job "${EXP_NAME}" "${DATA_PATH}" "${MODEL_PATH}"
     done
 done

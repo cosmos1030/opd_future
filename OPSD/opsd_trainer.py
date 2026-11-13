@@ -551,7 +551,36 @@ class OPSDTrainer(SFTTrainer):
             remaining = (total_len - positions - 1).clamp(min=1.0)
             returns   = returns / remaining
 
-        pg_per_token   = ce_per_token * returns
+        # ABLATION (DISTIL_PG_MODE=logp): the paper's Proposition 1 Term 2 is a
+        # score-function gradient on the SAMPLED token, which is what the SDPO path
+        # implements (SDPO/verl/trainer/ppo/core_algos.py:1278:
+        #     pg_per_token = student_log_probs * future_returns).
+        # This math path instead multiplies the returns by ce_per_token, a sum over
+        # the (top-k) vocabulary; with `returns` detached that differentiates to
+        # R_t * grad(CE_t), which reweights the local CE rather than propagating
+        # future cost back to the action choice. Default keeps the shipped behaviour.
+        _pg_mode = os.environ.get("DISTIL_PG_MODE", "ce")
+        if _pg_mode == "off":
+            # Term 2 removed entirely: pure forward CE, no future credit. The paper
+            # compares DistIL against SDPO (reverse KL, no future term), which moves
+            # both axes at once; this isolates how much the future term itself buys.
+            pg_per_token = torch.zeros_like(ce_per_token)
+        elif _pg_mode == "logp":
+            safe_labels = labels.clamp(min=0)
+            if top_k is not None and top_k > 0:
+                # student_log_probs was gathered to the teacher's top-k, so locate
+                # the sampled token within that gathered axis; tokens outside it
+                # contribute no score-function term.
+                pos = (top_k_indices == safe_labels.unsqueeze(-1)).float()
+                sampled_logp = (student_log_probs * pos).sum(-1)
+                sampled_logp = sampled_logp.masked_fill(pos.sum(-1) == 0, 0.0)
+            else:
+                sampled_logp = torch.gather(
+                    student_log_probs, dim=-1, index=safe_labels.unsqueeze(-1)
+                ).squeeze(-1)
+            pg_per_token = sampled_logp * returns
+        else:
+            pg_per_token = ce_per_token * returns
         per_token_loss = ce_per_token + pg_per_token
 
         num_valid = loss_mask.sum().clamp(min=1.0)

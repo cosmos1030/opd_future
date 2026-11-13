@@ -1,0 +1,15 @@
+# 대용량 산출물 — git 아님, 별도 전송
+outputs/
+models/
+valdump/
+logs/
+wandb/
+OPSD/wandb/
+OPSD/eval_results*/
+OPSD/eval_m500_base/
+probe/*.pt
+__pycache__/
+*.pyc
+
+# sed 백업본
+*.orig
